@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-900">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PrepAI - Your Personalised Interview Coach</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide icons -->
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc, 
+            setDoc, 
+            updateDoc, 
+            onSnapshot,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- CONSTANTS ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-prep-ai-app';
+        let firebaseConfig;
+        try {
+            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        } catch (e) {
+            console.error("Firebase config is not valid JSON.", e);
+            firebaseConfig = {}; // Fallback
+        }
+
+        // --- FIREBASE & APP STATE ---
+        let app, auth, db;
+        let currentUser = null;
+        let userProfile = null;
+        let profileUnsubscribe = null; // To detach listener on logout
+
+        // --- PAGE ELEMENTS ---
+        const pages = {};
+        let loadingScreen, appContainer, modal, modalTitle, modalMessage, modalBtnConfirm, modalBtnCancel;
+
+        // --- MODAL STATE ---
+        let modalConfirmCallback = null;
+        let modalCancelCallback = null;
+
+        // --- DATA MAPS ---
+        const roleSkillMap = {
+            'sde': { name: 'SDE', skills: ['DSA', 'OOPs Concepts', 'System Design (LLD/HLD)', 'Databases (SQL/NoSQL)', 'API Development (REST)', 'Version Control (Git/GitHub)'] },
+            'backend': { name: 'Backend Engineer', skills: ['Java/Python/Go/Node.js', 'REST/GraphQL API', 'Database Management', 'Redis Caching', 'Kafka/RabbitMQ', 'Docker', 'Kubernetes'] },
+            'frontend': { name: 'Frontend Engineer', skills: ['HTML', 'CSS', 'JavaScript (ES6+)', 'React/Angular/Vue', 'Redux/Context', 'Tailwind/Bootstrap', 'REST/GraphQL Integration'] },
+            'fullstack': { name: 'Full Stack Engineer', skills: ['React/Angular/Vue', 'Node.js/Django/Spring Boot', 'MySQL/MongoDB', 'REST APIs', 'Authentication', 'Git', 'CI/CD'] },
+            'aiml': { name: 'AI / ML Engineer', skills: ['Python', 'NumPy', 'Pandas', 'Matplotlib', 'TensorFlow/PyTorch', 'Data Preprocessing', 'Model Deployment (Flask/FastAPI)'] },
+            'data-engineer': { name: 'Data Engineer', skills: ['SQL', 'Python/Scala', 'Spark', 'Hadoop', 'Kafka', 'Airflow', 'Snowflake/BigQuery', 'AWS/GCP Data Pipelines'] },
+            'data-scientist': { name: 'Data Scientist', skills: ['Python/R', 'Statistics', 'Probability', 'Visualization', 'ML Models', 'Data Wrangling (SQL)', 'Power BI/Tableau'] },
+            'devops': { name: 'DevOps Engineer', skills: ['Linux', 'Shell Scripting', 'Jenkins/GitHub Actions', 'Docker', 'Kubernetes', 'AWS/GCP', 'Terraform/Ansible'] },
+            'cloud': { name: 'Cloud Engineer', skills: ['AWS/Azure/GCP', 'IAM & Networking', 'S3/EC2/Lambda', 'Terraform', 'Cloud Monitoring (CloudWatch/StackDriver)'] },
+            'cybersecurity': { name: 'Cybersecurity Engineer', skills: ['Networking Protocols', 'Linux', 'Penetration Testing', 'VPN/Firewall', 'Cryptography', 'Wireshark/Burp Suite/Nmap'] },
+            'mobile': { name: 'Mobile App Developer', skills: ['Kotlin/Java/Swift', 'Flutter/React Native', 'UI/UX Design', 'REST API Integration', 'SQLite/Room', 'App Deployment'] }
+        };
+
+        const dsaTopics = [
+            'Arrays', 'Strings', 'Linked List', 'Stacks', 'Queues', 'Trees', 'Graphs',
+            'Heaps', 'Recursion', 'Dynamic Programming', 'Sorting', 'Searching', 'Sliding Window',
+            'Binary Search', 'Bit Manipulation', 'Two Pointers'
+        ];
+        
+        const tierRequirements = {
+            tier1: {
+                name: "Tier 1 (20 LPA+)",
+                dsaLevel: [3, 4], // Requires Intermediate or Advanced
+                dsaMastery: "200-400+ quality problems (50-60 Hard, 120+ Medium)",
+                dsaFocus: ["Dynamic Programming", "Graphs", "Trees", "Binary Search", "Heaps"],
+                skills: {
+                    'sde': ['System Design (LLD/HLD)', 'OOPs Concepts', 'Databases (SQL/NoSQL)'],
+                    'backend': ['Database Management', 'Redis Caching', 'Docker', 'Kubernetes'],
+                }
+            },
+            tier2: {
+                name: "Tier 2 (10-19 LPA)",
+                dsaLevel: [2, 3, 4], // Requires Beginner, Intermediate or Advanced
+                dsaMastery: "100-200+ quality problems (Focus on Medium)",
+                dsaFocus: ["Trees", "Graphs", "Recursion", "Dynamic Programming"],
+                skills: {
+                    'sde': ['OOPs Concepts', 'Databases (SQL/NoSQL)'],
+                    'backend': ['Database Management', 'REST/GraphQL API'],
+                }
+            },
+            tier3: {
+                name: "Tier 3 (<10 LPA)",
+                dsaLevel: [2, 3, 4], // Requires Beginner, Intermediate or Advanced
+                dsaMastery: "50-100+ quality problems (Focus on Easy/Medium)",
+                dsaFocus: ["Arrays", "Strings", "Linked List", "Sorting", "Searching"],
+                skills: {
+                    'sde': ['OOPs Concepts'],
+                    'backend': ['REST/GraphQL API'],
+                }
+            }
+        };
+
+        // --- UTILITY FUNCTIONS ---
+        
+        /**
+         * Shows a specific page and hides all others.
+         * @param {string} pageId - The ID of the page element to show.
+         */
+        function showPage(pageId) {
+            Object.values(pages).forEach(page => page.classList.add('hidden'));
+            if (pages[pageId]) {
+                pages[pageId].classList.remove('hidden');
+            } else {
+                console.error(`Page not found: ${pageId}`);
+                pages['home-page'].classList.remove('hidden');
+            }
+        }
+
+        /**
+         * Replaces Lucide icon placeholders with SVGs.
+         */
+        function renderIcons() {
+            if (window.lucide) {
+                window.lucide.createIcons();
+            }
+        }
+
+        /**
+         * Shows a custom modal.
+         * @param {string} title - The title of the modal.
+         * @param {string} message - The message body.
+         * @param {string} confirmText - Text for the confirm button.
+         * @param {string} [cancelText] - Text for the cancel button (if any).
+         * @returns {Promise<boolean>} - Resolves true if confirmed, false if canceled.
+         */
+        function showModal(title, message, confirmText = 'OK', cancelText = null) {
+            return new Promise((resolve) => {
+                modalTitle.textContent = title;
+                modalMessage.textContent = message;
+                modalBtnConfirm.textContent = confirmText;
+
+                if (cancelText) {
+                    modalBtnCancel.textContent = cancelText;
+                    modalBtnCancel.classList.remove('hidden');
+                } else {
+                    modalBtnCancel.classList.add('hidden');
+                }
+
+                modal.classList.remove('hidden');
+
+                modalConfirmCallback = () => {
+                    modal.classList.add('hidden');
+                    resolve(true);
+                };
+
+                modalCancelCallback = () => {
+                    modal.classList.add('hidden');
+                    resolve(false);
+                };
+            });
+        }
+        
+        // --- FIREBASE FUNCTIONS ---
+
+        /**
+         * Gets the Firestore document path for the user's profile.
+         * @returns {string}
+         */
+        function getUserProfilePath() {
+             if (!currentUser) return null;
+             // Using a specific doc ID 'userProfile' for simplicity
+             return `artifacts/${appId}/users/${currentUser.uid}/profile/userProfile`;
+        }
+        
+        /**
+         * Attaches a real-time listener to the user's profile document.
+         */
+        function attachProfileListener() {
+            if (profileUnsubscribe) profileUnsubscribe(); // Detach old listener
+            if (!currentUser) return;
+
+            const profilePath = getUserProfilePath();
+            if (!profilePath) return;
+            
+            const profileRef = doc(db, profilePath);
+            
+            profileUnsubscribe = onSnapshot(profileRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    userProfile = docSnap.data();
+                    console.log("Profile data updated:", userProfile);
+                    // Profile exists, go to dashboard
+                    renderDashboard();
+                    showPage('dashboard-page');
+                } else {
+                    // Profile doesn't exist, go to setup
+                    userProfile = null;
+                    console.log("No profile found, directing to setup.");
+                    renderSetupWizard();
+                    showPage('setup-page');
+                }
+                loadingScreen.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+            }, (error) => {
+                console.error("Error listening to profile:", error);
+                loadingScreen.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+                showPage('home-page');
+            });
+        }
+        
+        /**
+         * Handles user authentication state changes.
+         * @param {object | null} user - The Firebase auth user object.
+         */
+        function handleAuthStateChanged(user) {
+            if (user) {
+                console.log("User is signed in:", user.uid);
+                currentUser = user;
+                // Show loading screen while we check for profile
+                loadingScreen.classList.remove('hidden');
+                appContainer.classList.add('hidden');
+                // Now that we're authed, listen for profile
+                attachProfileListener();
+            } else {
+                console.log("User is signed out.");
+                currentUser = null;
+                userProfile = null;
+                if (profileUnsubscribe) profileUnsubscribe(); // Detach listener
+                
+                // Show home page
+                loadingScreen.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+                showPage('home-page');
+            }
+            renderNav();
+        }
+
+        /**
+         * Signs the user in.
+         */
+        async function signIn() {
+            try {
+                loadingScreen.classList.remove('hidden');
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Signing in with custom token...");
+                    try {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } catch (tokenError) {
+                        console.error("Custom token sign-in failed:", tokenError.message);
+                        // Check if the error is specifically an invalid token
+                        if (tokenError.code === 'auth/invalid-custom-token') {
+                            console.log("Invalid custom token. Falling back to anonymous sign-in...");
+                            await signInAnonymously(auth);
+                        } else {
+                            // Re-throw other token-related errors
+                            throw tokenError;
+                        }
+                    }
+                } else {
+                    console.log("Signing in anonymously...");
+                    await signInAnonymously(auth);
+                }
+                // onAuthStateChanged will handle the rest
+            } catch (error) {
+                console.error("Error signing in:", error);
+                loadingScreen.classList.add('hidden');
+                await showModal("Sign-In Error", "There was an error signing in. Please try again.");
+            }
+        }
+        
+        // --- PAGE RENDER FUNCTIONS ---
+
+        /**
+         * Renders the navigation bar based on auth state.
+         */
+        function renderNav() {
+            const navElement = document.getElementById('main-nav');
+            if (!navElement) return;
+
+            let navLinks = '';
+            if (currentUser && userProfile) {
+                // Logged in and has profile
+                navLinks = `
+                    <button data-page="dashboard-page" class="nav-link text-sm font-semibold leading-6 text-white hover:text-indigo-300">Dashboard</button>
+                    <button data-page="roadmap-page" class="nav-link text-sm font-semibold leading-6 text-white hover:text-indigo-300">My Roadmap</button>
+                    <button data-page="profile-page" class="nav-link text-sm font-semibold leading-6 text-white hover:text-indigo-300">Profile</button>
+                `;
+            } else if (currentUser && !userProfile) {
+                // Logged in, in setup
+                navLinks = `
+                    <span class="text-sm font-semibold leading-6 text-gray-300">Complete Your Profile...</span>
+                `;
+            } else {
+                // Logged out
+                navLinks = `
+                    <button data-page="home-page" class="nav-link text-sm font-semibold leading-6 text-white hover:text-indigo-300">Features</button>
+                    <button id="nav-login-btn" class="text-sm font-semibold leading-6 text-white hover:text-indigo-300">Log in <span aria-hidden="true">&rarr;</span></button>
+                `;
+            }
+            
+            navElement.innerHTML = navLinks;
+        }
+        
+        /**
+         * Renders the setup wizard.
+         */
+        function renderSetupWizard() {
+            console.log("Rendering setup wizard");
+            const wizardContainer = document.getElementById('setup-wizard-container');
+            if (!wizardContainer) return;
+            
+            // Populate role dropdown
+            const roleSelect = wizardContainer.querySelector('#role');
+            if (roleSelect) {
+                roleSelect.innerHTML = '<option value="" disabled selected>Select your target role</option>';
+                Object.keys(roleSkillMap).forEach(key => {
+                    roleSelect.innerHTML += `<option value="${key}">${roleSkillMap[key].name}</option>`;
+                });
+            }
+
+            // Populate DSA topics
+            const dsaGrid = wizardContainer.querySelector('#dsa-grid');
+            if (dsaGrid) {
+                dsaGrid.innerHTML = dsaTopics.map(topic => `
+                    <div class="bg-gray-800 p-4 rounded-lg">
+                        <label class="block text-sm font-medium text-white mb-2">${topic}</label>
+                        <select name="dsa-${topic.toLowerCase().replace(/ /g, '-')}" class="block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                            <option value="1">1 (Yet to Start)</option>
+                            <option value="2">2 (Beginner)</option>
+                            <option value="3">3 (Intermediate)</option>
+                            <option value="4">4 (Advanced)</option>
+                        </select>
+                    </div>
+                `).join('');
+            }
+            
+            // Reset to step 1
+            showSetupStep(1);
+        }
+        
+        /**
+         * Shows a specific step in the setup wizard.
+         * @param {number} stepNum - The step number to show.
+         */
+        function showSetupStep(stepNum) {
+            const steps = document.querySelectorAll('.setup-step');
+            const progressIndicators = document.querySelectorAll('nav[aria-label="Progress"] ol li');
+            
+            steps.forEach(step => step.classList.add('hidden'));
+            
+            const stepToShow = document.getElementById(`setup-step-${stepNum}`);
+            if (stepToShow) {
+                 stepToShow.classList.remove('hidden');
+            } else {
+                console.error(`Setup step ${stepNum} not found.`);
+                return;
+            }
+
+            progressIndicators.forEach((indicator, index) => { // indicator is the LI
+                const lineDiv = indicator.querySelector('.progress-step'); // The div containing the line
+                const line = lineDiv ? lineDiv.querySelector('.h-0\\.5') : null; // The line (CSS selector needs double escape for '.')
+                const dotSpan = indicator.querySelector('span[class*="relative flex h-8 w-8"]'); // The dot container
+                const dotComplete = dotSpan ? dotSpan.querySelector('.progress-dot-complete') : null; // The check icon
+                const dotCurrent = dotSpan ? dotSpan.querySelector('.progress-dot-current') : null; // The pulsing dot
+                
+                if (!line || !dotSpan || !dotComplete || !dotCurrent) {
+                    console.warn("Progress bar HTML structure not found or incomplete inside LI:", indicator);
+                    return; 
+                }
+
+                // Make dots clickable
+                const stepToGo = index + 1;
+                dotSpan.dataset.step = stepToGo; // Add data-step attribute
+
+                if (index < stepNum - 1) {
+                    // === COMPLETED STEP ===
+                    line.classList.remove('bg-gray-600');
+                    line.classList.add('bg-indigo-600');
+                    dotSpan.classList.remove('border-gray-600', 'bg-gray-900', 'border-indigo-600');
+                    dotSpan.classList.add('bg-indigo-600'); 
+                    dotComplete.classList.remove('hidden');
+                    dotCurrent.classList.add('hidden');
+
+                    // Make clickable
+                    dotSpan.classList.add('cursor-pointer', 'progress-dot-nav');
+                    dotSpan.classList.remove('pointer-events-none');
+
+                } else if (index === stepNum - 1) {
+                    // === CURRENT STEP ===
+                    line.classList.remove('bg-indigo-600');
+                    line.classList.add('bg-gray-600');
+                    dotSpan.classList.remove('bg-gray-900', 'bg-indigo-600');
+                    dotSpan.classList.add('border-indigo-600');
+                    dotSpan.classList.remove('border-gray-600');
+                    dotComplete.classList.add('hidden');
+                    dotCurrent.classList.remove('hidden');
+
+                    // Not clickable
+                    dotSpan.classList.remove('cursor-pointer', 'progress-dot-nav');
+                    dotSpan.classList.add('pointer-events-none');
+
+                } else {
+                    // === FUTURE STEP ===
+                    line.classList.remove('bg-indigo-600');
+                    line.classList.add('bg-gray-600');
+                    dotSpan.classList.add('border-gray-600', 'bg-gray-900');
+                    dotSpan.classList.remove('border-indigo-600', 'bg-indigo-600');
+                    dotComplete.classList.add('hidden');
+                    dotCurrent.classList.add('hidden');
+
+                    // Not clickable
+                    dotSpan.classList.remove('cursor-pointer', 'progress-dot-nav');
+                    dotSpan.classList.add('pointer-events-none');
+                }
+            });
+
+            // Special logic for step 3 (dynamic skills)
+            if (stepNum === 3) {
+                const role = document.getElementById('role').value;
+                const skillsContainer = document.getElementById('skills-checkbox-container');
+                if (role && roleSkillMap[role]) {
+                    const skills = roleSkillMap[role].skills;
+                    skillsContainer.innerHTML = skills.map(skill => `
+                        <label class="relative flex items-start">
+                            <div class="flex h-6 items-center">
+                                <input name="skills" value="${skill}" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600 bg-gray-800">
+                            </div>
+                            <div class="ml-3 text-sm leading-6">
+                                <span class="font-medium text-white">${skill}</span>
+                            </div>
+                        </label>
+                    `).join('');
+                } else {
+                    showSetupStep(2);
+                    console.warn("Please select a career role first.");
+                }
+            }
+        }
+        
+        /**
+         * Handles the submission of the setup wizard.
+         * @param {Event} e - The form submit event.
+         */
+        async function handleSetupSubmit(e) {
+            e.preventDefault();
+            const form = e.target;
+            const formData = new FormData(form);
+            const newProfile = {};
+
+            const dsaLevels = {};
+            const knownSkills = [];
+            
+            for (let [key, value] of formData.entries()) {
+                if (key.startsWith('dsa-')) {
+                    dsaLevels[key.replace('dsa-', '')] = parseInt(value, 10);
+                } else if (key === 'skills') {
+                    knownSkills.push(value);
+                } else {
+                    newProfile[key] = value;
+                }
+            }
+            
+            newProfile.dsaLevels = dsaLevels;
+            newProfile.knownSkills = knownSkills;
+            newProfile.createdAt = new Date().toISOString();
+            
+            console.log("Saving new profile:", newProfile);
+            
+            const profilePath = getUserProfilePath();
+            if (!profilePath) {
+                await showModal("Error", "You are not signed in. Please refresh the page.");
+                return;
+            }
+            
+            const profileRef = doc(db, profilePath);
+            try {
+                await setDoc(profileRef, newProfile);
+                console.log("Profile created successfully!");
+                // onSnapshot will automatically catch this change and move to the dashboard
+            } catch (error) {
+                console.error("Error saving profile:", error);
+                await showModal("Save Error", "There was an error saving your profile. Please try again.");
+            }
+        }
+
+        /**
+         * Renders the main dashboard page with user data.
+         */
+        function renderDashboard() {
+            if (!userProfile) return;
+            console.log("Rendering dashboard...");
+            
+            showPage('dashboard-page');
+            document.getElementById('dashboard-welcome').textContent = `Welcome, ${userProfile.name || 'User'}!`;
+            
+            const targetRole = roleSkillMap[userProfile.role]?.name || 'Unknown Role';
+            const targetTier = tierRequirements[userProfile.tier]?.name || 'Unknown Tier';
+            document.getElementById('dashboard-subheader').textContent = `Your readiness analysis for: ${targetRole} (${targetTier})`;
+
+            renderGapAnalysis();
+            renderRoadmapSection();
+            renderIcons(); // Re-render icons after dynamic content change
+        }
+        
+        /**
+         * Renders the Gap Analysis component on the dashboard.
+         */
+        function renderGapAnalysis() {
+            if (!userProfile) return;
+
+            const requirements = tierRequirements[userProfile.tier];
+            const targetRoleSkills = roleSkillMap[userProfile.role].skills;
+            const knownSkills = userProfile.knownSkills || [];
+            const dsaLevels = userProfile.dsaLevels || {};
+
+            // 1. Skill Gap Analysis
+            const skillGapContainer = document.getElementById('skill-gap-analysis');
+            const requiredSkills = requirements.skills[userProfile.role] || targetRoleSkills; // Use tier-specific if available, else all role skills
+            
+            const skillGaps = targetRoleSkills.map(skill => {
+                const isKnown = knownSkills.includes(skill);
+                const isRequired = requiredSkills.includes(skill);
+                let status = 'neutral';
+                let icon = 'minus';
+                let color = 'gray';
+                
+                if (isKnown) {
+                    status = 'Known';
+                    icon = 'check-circle-2';
+                    color = 'green';
+                } else if (!isKnown && isRequired) {
+                    status = 'Gap (Required)';
+                    icon = 'alert-triangle';
+                    color = 'yellow';
+                } else if (!isKnown && !isRequired) {
+                    status = 'Not Known';
+                    icon = 'circle-dashed';
+                    color = 'gray';
+                }
+
+                return `
+                    <li class="flex items-center justify-between py-2">
+                        <div class="flex items-center">
+                            <i data-lucide="${icon}" class="w-4 h-4 text-${color}-400 mr-2"></i>
+                            <span class="text-sm font-medium ${isKnown ? 'text-white' : 'text-gray-300'}">${skill}</span>
+                        </div>
+                        <span class="text-sm ${isKnown ? 'text-green-400' : 'text-yellow-400'}">${isKnown ? 'Known' : (isRequired ? 'Gap' : 'Optional')}</span>
+                    </li>
+                `;
+            });
+            skillGapContainer.innerHTML = skillGaps.join('');
+            
+            // 2. DSA Topic Analysis
+            const dsaGapContainer = document.getElementById('dsa-gap-analysis');
+            const requiredDsaLevel = requirements.dsaLevel;
+            const dsaFocusTopics = requirements.dsaFocus;
+            
+            const dsaGaps = dsaTopics.map(topic => {
+                const level = dsaLevels[topic.toLowerCase().replace(/ /g, '-')] || 1;
+                const isStrong = requiredDsaLevel.includes(level);
+                const isFocus = dsaFocusTopics.includes(topic);
+
+                let icon = 'circle-dashed';
+                let color = 'gray';
+                let status = `Level ${level}`;
+
+                if (isStrong && isFocus) {
+                    icon = 'star';
+                    color = 'green';
+                    status = `Strong (L${level})`;
+                } else if (isStrong && !isFocus) {
+                    icon = 'check-circle-2';
+                    color = 'blue';
+                    status = `Good (L${level})`;
+                } else if (!isStrong && isFocus) {
+                    icon = 'alert-triangle';
+                    color = 'yellow';
+                    status = `Weak Focus (L${level})`;
+                } else if (!isStrong && !isFocus) {
+                    icon = 'minus-circle';
+                    color = 'gray';
+                    status = `Weak (L${level})`;
+                }
+
+                return `
+                    <li class="flex items-center justify-between py-2">
+                        <div class="flex items-center">
+                            <i data-lucide="${icon}" class="w-4 h-4 text-${color}-400 mr-2"></i>
+                            <span class="${isFocus ? 'font-bold' : ''} text-sm ${isStrong ? 'text-white' : 'text-gray-300'}">${topic}</span>
+                        </div>
+                        <span class="text-sm text-${color}-400">${status}</span>
+                    </li>
+                `;
+            });
+            dsaGapContainer.innerHTML = dsaGaps.join('');
+            
+            // 3. DSA Mastery
+            document.getElementById('dsa-mastery-target').textContent = requirements.dsaMastery;
+        }
+        
+        /**
+         * Renders the roadmap section on the dashboard (or generates it).
+         */
+        function renderRoadmapSection() {
+            const container = document.getElementById('roadmap-promo-container');
+            if (!userProfile.roadmap) {
+                // No roadmap, show generation button
+                container.innerHTML = `
+                    <h3 class="text-base font-semibold leading-6 text-white">Generate Your AI Roadmap</h3>
+                    <div class="mt-2 max-w-xl text-sm text-gray-300">
+                        <p>You don't have a personalized roadmap yet. Let our AI analyze your profile and build a step-by-step plan for you.</p>
+                    </div>
+                    <div class="mt-5">
+                        <button id="generate-roadmap-btn" type="button" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                            Generate My Roadmap
+                        </button>
+                    </div>
+                `;
+            } else {
+                // Roadmap exists, show preview
+                const allTasks = userProfile.roadmap.phases.flatMap(p => p.tasks);
+                const completedTasks = allTasks.filter(t => t.completed).length;
+                const totalTasks = allTasks.length;
+                const progress = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+                
+                container.innerHTML = `
+                    <h3 class="text-base font-semibold leading-6 text-white">Your Roadmap Progress (${progress}%)</h3>
+                    <div class="mt-2 max-w-xl text-sm text-gray-300">
+                        <p>You have completed ${completedTasks} of ${totalTasks} tasks. Keep up the great work!</p>
+                    </div>
+                    <!-- Progress Bar -->
+                    <div class="w-full bg-gray-700 rounded-full h-2.5 my-4">
+                        <div class="bg-indigo-600 h-2.5 rounded-full" style="width: ${progress}%"></div>
+                    </div>
+                    <div class="mt-5">
+                        <button data-page="roadmap-page" type="button" class="nav-link rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                            View Full Roadmap
+                        </button>
+                    </div>
+                `;
+            }
+        }
+        
+        /**
+         * Simulates AI generation of a roadmap based on profile.
+         */
+        async function generateRoadmap() {
+            console.log("Generating roadmap...");
+            if (!userProfile) return;
+
+            const requirements = tierRequirements[userProfile.tier];
+            const targetRoleSkills = roleSkillMap[userProfile.role].skills;
+            const knownSkills = userProfile.knownSkills || [];
+            const dsaLevels = userProfile.dsaLevels || {};
+            const dsaFocusTopics = requirements.dsaFocus;
+
+            // Find skill gaps
+            const skillGaps = targetRoleSkills.filter(skill => !knownSkills.includes(skill));
+            
+            // Find weak DSA topics
+            const weakDsaTopics = dsaTopics.filter(topic => {
+                const level = dsaLevels[topic.toLowerCase().replace(/ /g, '-')] || 1;
+                return !requirements.dsaLevel.includes(level);
+            });
+            
+            // Find weak FOCUS Dsa topics (high priority)
+            const weakFocusTopics = weakDsaTopics.filter(topic => dsaFocusTopics.includes(topic));
+            
+            // Build roadmap phases
+            const phases = [];
+            
+            // Phase 1: Core DSA Foundations (if weak)
+            const coreFoundation = ["Arrays", "Strings", "Sorting", "Searching"];
+            const weakCore = weakDsaTopics.filter(t => coreFoundation.includes(t));
+            if (weakCore.length > 0) {
+                phases.push({
+                    title: "Phase 1: Core DSA Foundations",
+                    goal: "Build a strong foundation in the most common DSA topics.",
+                    tasks: weakCore.map(topic => ({ text: `Study and practice ${topic} (10 Easy, 5 Medium problems)`, completed: false }))
+                });
+            }
+
+            // Phase 2: Target Role Skills
+            if (skillGaps.length > 0) {
+                 phases.push({
+                    title: `Phase ${phases.length + 1}: Target Role Skills (${roleSkillMap[userProfile.role].name})`,
+                    goal: "Learn the core technologies required for your target role.",
+                    tasks: skillGaps.map(skill => ({ text: `Learn and build a small project with ${skill}`, completed: false }))
+                });
+            }
+            
+            // Phase 3: Advanced DSA Gaps (Focus Topics)
+            if (weakFocusTopics.length > 0) {
+                 phases.push({
+                    title: `Phase ${phases.length + 1}: Advanced DSA (Tier 1 Focus)`,
+                    goal: `Master the high-priority topics for ${requirements.name} interviews.`,
+                    tasks: weakFocusTopics.map(topic => ({ text: `Deep dive into ${topic} (5 Medium, 3 Hard problems)`, completed: false }))
+                });
+            }
+            
+            // Phase 4: Remaining DSA Gaps
+            const remainingWeak = weakDsaTopics.filter(t => !weakCore.includes(t) && !weakFocusTopics.includes(t));
+             if (remainingWeak.length > 0) {
+                 phases.push({
+                    title: `Phase ${phases.length + 1}: DSA Polish`,
+                    goal: "Strengthen your remaining weak DSA topics.",
+                    tasks: remainingWeak.map(topic => ({ text: `Review and practice ${topic} (5 Medium problems)`, completed: false }))
+                });
+            }
+
+            // Phase 5: Practice & Mocks
+            phases.push({
+                title: `Phase ${phases.length + 1}: Interview Readiness`,
+                goal: "Simulate interview conditions and review all concepts.",
+                tasks: [
+                    { text: `Complete 10 medium LeetCode problems under 30 mins each`, completed: false },
+                    { text: `Complete 5 hard LeetCode problems under 45 mins each`, completed: false },
+                    { text: `Perform 3 mock interviews (technical)`, completed: false },
+                    { text: `Perform 2 mock interviews (system design)`, completed: false }
+                ]
+            });
+            
+            const newRoadmap = {
+                generatedAt: new Date().toISOString(),
+                targetRole: userProfile.role,
+                targetTier: userProfile.tier,
+                phases: phases
+            };
+            
+            // Save to Firestore
+            const profilePath = getUserProfilePath();
+            const profileRef = doc(db, profilePath);
+            try {
+                await updateDoc(profileRef, { roadmap: newRoadmap });
+                console.log("Roadmap saved successfully!");
+                // onSnapshot will handle UI update
+            } catch (error) {
+                console.error("Error saving roadmap:", error);
+                await showModal("Error", "There was an an error generating your roadmap.");
+            }
+        }
+        
+        /**
+         * Renders the dedicated roadmap page.
+         */
+        function renderRoadmapPage() {
+            showPage('roadmap-page');
+            const container = document.getElementById('roadmap-page-container');
+            if (!userProfile || !userProfile.roadmap) {
+                container.innerHTML = `
+                    <div class="text-center">
+                        <h2 class="text-2xl font-semibold text-white">No Roadmap Found</h2>
+                        <p class="mt-2 text-gray-300">Go to your dashboard to generate your personalized roadmap.</p>
+                        <button data-page="dashboard-page" class="nav-link mt-4 rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+                            Go to Dashboard
+                        </button>
+                    </div>
+                `;
+                return;
+            }
+
+            const { phases, targetRole, targetTier } = userProfile.roadmap;
+            document.getElementById('roadmap-header').textContent = `Your Roadmap to ${roleSkillMap[targetRole].name} (${tierRequirements[targetTier].name})`;
+            
+            container.innerHTML = phases.map((phase, phaseIndex) => `
+                <div class="bg-gray-800 shadow-lg rounded-lg overflow-hidden mb-6">
+                    <div class="px-4 py-5 sm:p-6">
+                        <h3 class="text-lg font-semibold leading-6 text-indigo-400">${phase.title}</h3>
+                        <p class="mt-1 text-sm text-gray-300">${phase.goal}</p>
+                        <ul class="mt-4 space-y-3">
+                            ${phase.tasks.map((task, taskIndex) => `
+                                <li class="flex items-start">
+                                    <div class="flex-shrink-0">
+                                        <input 
+                                            id="task-${phaseIndex}-${taskIndex}" 
+                                            type="checkbox" 
+                                            class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600 bg-gray-700"
+                                            data-phase-index="${phaseIndex}"
+                                            data-task-index="${taskIndex}"
+                                            ${task.completed ? 'checked' : ''}
+                                        >
+                                    </div>
+                                    <div class="ml-3 text-sm leading-6">
+                                        <label for="task-${phaseIndex}-${taskIndex}" class="${task.completed ? 'line-through text-gray-500' : 'text-white'} font-medium cursor-pointer">
+                                            ${task.text}
+                                        </label>
+                                    </div>
+                                </li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        /**
+         * Handles checking/unchecking a roadmap task.
+         * @param {Event} e - The change event from the checkbox.
+         */
+        async function handleTaskToggle(e) {
+            if (!e.target.matches('input[type="checkbox"][data-phase-index]')) return;
+            
+            const phaseIndex = parseInt(e.target.dataset.phaseIndex, 10);
+            const taskIndex = parseInt(e.target.dataset.taskIndex, 10);
+            const isCompleted = e.target.checked;
+            
+            if (!userProfile || !userProfile.roadmap) return;
+            
+            // Create a deep copy to avoid modifying local state directly
+            const newRoadmap = JSON.parse(JSON.stringify(userProfile.roadmap));
+            
+            if (newRoadmap.phases[phaseIndex] && newRoadmap.phases[phaseIndex].tasks[taskIndex]) {
+                newRoadmap.phases[phaseIndex].tasks[taskIndex].completed = isCompleted;
+                
+                // Update Firestore
+                const profilePath = getUserProfilePath();
+                const profileRef = doc(db, profilePath);
+                try {
+                    await updateDoc(profileRef, { roadmap: newRoadmap });
+                    console.log("Roadmap task updated.");
+                    // onSnapshot will update the UI, but we can also update locally for snappiness
+                    const label = e.target.closest('li').querySelector('label');
+                    if (label) {
+                        label.classList.toggle('line-through', isCompleted);
+                        label.classList.toggle('text-gray-500', isCompleted);
+                        label.classList.toggle('text-white', !isCompleted);
+                    }
+                } catch (error) {
+                    console.error("Error updating task:", error);
+                    // Revert checkbox on error
+                    e.target.checked = !isCompleted;
+                }
+            }
+        }
+        
+        /**
+         * Renders the profile page for updates.
+         */
+         function renderProfilePage() {
+             showPage('profile-page');
+             if (!userProfile) return;
+
+             // Populate the form with existing data
+             document.getElementById('profile-name').value = userProfile.name || '';
+             document.getElementById('profile-college').value = userProfile.college || '';
+             document.getElementById('profile-course').value = userProfile.course || '';
+             document.getElementById('profile-year').value = userProfile.year || '';
+             document.getElementById('profile-cgpa').value = userProfile.cgpa || '';
+             
+             document.getElementById('profile-experience').value = userProfile.experience || '';
+             document.getElementById('profile-timeline').value = userProfile.timeline || '';
+             document.getElementById('profile-tier').value = userProfile.tier || '';
+             
+             const roleSelect = document.getElementById('profile-role');
+             roleSelect.innerHTML = ''; // Clear
+             Object.keys(roleSkillMap).forEach(key => {
+                 roleSelect.innerHTML += `<option value="${key}" ${userProfile.role === key ? 'selected' : ''}>${roleSkillMap[key].name}</option>`;
+             });
+         }
+         
+         /**
+          * Handles submission of the profile update form.
+          * @param {Event} e - The form submit event.
+          */
+         async function handleProfileUpdate(e) {
+             e.preventDefault();
+             const form = e.target;
+             const formData = new FormData(form);
+             const updatedProfileData = {};
+
+             for (let [key, value] of formData.entries()) {
+                 updatedProfileData[key.replace('profile-', '')] = value;
+             }
+             
+             console.log("Updating profile with:", updatedProfileData);
+             
+             // Check if role changed, which would invalidate roadmap
+             if (updatedProfileData.role !== userProfile.role || updatedProfileData.tier !== userProfile.tier) {
+                const isConfirmed = await showModal(
+                    "Warning", 
+                    "Changing your role or tier will reset your personalized roadmap. Are you sure you want to continue?", 
+                    "Yes, Reset Roadmap", 
+                    "Cancel"
+                );
+
+                 if (isConfirmed) {
+                     updatedProfileData['roadmap'] = null; // Clear roadmap
+                 } else {
+                     return; // Cancel update
+                 }
+             }
+
+             const profilePath = getUserProfilePath();
+             if (!profilePath) return;
+             
+             const profileRef = doc(db, profilePath);
+             try {
+                 await updateDoc(profileRef, updatedProfileData);
+                 await showModal("Success", "Your profile has been updated successfully.");
+                 showPage('dashboard-page');
+             } catch (error) {
+                 console.error("Error updating profile:", error);
+                 await showModal("Update Error", "There was an error updating your profile. Please try again.");
+             }
+         }
+
+
+        // --- INITIALIZATION ---
+        
+        /**
+         * Caches all necessary page and modal elements.
+         */
+        function cacheElements() {
+            pages['home-page'] = document.getElementById('home-page');
+            pages['setup-page'] = document.getElementById('setup-page');
+            pages['dashboard-page'] = document.getElementById('dashboard-page');
+            pages['roadmap-page'] = document.getElementById('roadmap-page');
+            pages['profile-page'] = document.getElementById('profile-page');
+            
+            loadingScreen = document.getElementById('loading-screen');
+            appContainer = document.getElementById('app-container');
+
+            modal = document.getElementById('custom-modal');
+            modalTitle = document.getElementById('modal-title');
+            modalMessage = document.getElementById('modal-message');
+            modalBtnConfirm = document.getElementById('modal-btn-confirm');
+            modalBtnCancel = document.getElementById('modal-btn-cancel');
+        }
+
+        /**
+         * Attaches all global event listeners.
+         */
+        function attachEventListeners() {
+            // Navigation clicks
+            document.body.addEventListener('click', (e) => {
+                // Page navigation
+                const navButton = e.target.closest('.nav-link');
+                if (navButton && navButton.dataset.page) {
+                    e.preventDefault();
+                    const pageId = navButton.dataset.page;
+                    if (pageId === 'roadmap-page') {
+                        renderRoadmapPage();
+                    } else if (pageId === 'profile-page') {
+                        renderProfilePage();
+                    } else {
+                        showPage(pageId);
+                    }
+                }
+                
+                // Home page "Start" button
+                if (e.target.id === 'home-start-btn' || e.target.id === 'nav-login-btn') {
+                    e.preventDefault();
+                    signIn();
+                }
+                
+                // Setup wizard navigation
+                if (e.target.matches('.setup-next-btn')) {
+                    e.preventDefault();
+                    const nextStep = parseInt(e.target.dataset.next, 10);
+                    showSetupStep(nextStep);
+                }
+                if (e.target.matches('.setup-prev-btn')) {
+                    e.preventDefault();
+                    const prevStep = parseInt(e.target.dataset.prev, 10);
+                    showSetupStep(prevStep);
+                }
+
+                // NEW: Setup wizard progress dot navigation
+                const progressDot = e.target.closest('.progress-dot-nav');
+                if (progressDot && progressDot.dataset.step) {
+                    e.preventDefault();
+                    const step = parseInt(progressDot.dataset.step, 10);
+                    // Add validation logic if needed, e.g., don't re-validate
+                    showSetupStep(step);
+                }
+                
+                // Generate Roadmap button
+                if (e.target.id === 'generate-roadmap-btn') {
+                    e.preventDefault();
+                    e.target.textContent = "Generating...";
+                    e.target.disabled = true;
+                    generateRoadmap(); // Async
+                }
+                
+                // Chatbot toggle
+                if (e.target.id === 'chat-toggle' || e.target.closest('#chat-toggle')) {
+                    document.getElementById('chat-window').classList.toggle('hidden');
+                }
+                // Chatbot close
+                if (e.target.id === 'chat-close' || e.target.closest('#chat-close')) {
+                     document.getElementById('chat-window').classList.add('hidden');
+                }
+            });
+            
+            // Setup wizard form submission
+            document.getElementById('setup-form').addEventListener('submit', handleSetupSubmit);
+            
+            // Roadmap task toggle
+            document.getElementById('roadmap-page-container').addEventListener('change', handleTaskToggle);
+            
+            // Profile update submission
+            document.getElementById('profile-update-form').addEventListener('submit', handleProfileUpdate);
+
+            // Modal button listeners
+            modalBtnConfirm.addEventListener('click', () => {
+                if (modalConfirmCallback) modalConfirmCallback();
+            });
+            modalBtnCancel.addEventListener('click', () => {
+                if (modalCancelCallback) modalCancelCallback();
+            });
+        }
+
+        /**
+         * Main app initialization function.
+         */
+        async function initApp() {
+            cacheElements();
+            renderIcons(); // Render static icons on load
+
+            // Initialize Firebase
+            if (!firebaseConfig.apiKey) {
+                console.error("Firebase config is missing!");
+                document.getElementById('loading-text').textContent = "Error: App configuration is missing. Please contact support.";
+                return;
+            }
+            
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); // Enable Firestore logging
+
+                // Set up auth listener
+                onAuthStateChanged(auth, handleAuthStateChanged);
+
+                // Attach all event listeners
+                attachEventListeners();
+
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                document.getElementById('loading-text').textContent = "Error initializing app. Please refresh.";
+            }
+        }
+
+        // --- START APP ---
+        document.addEventListener('DOMContentLoaded', initApp);
+
+    </script>
+    
+    <!-- Custom Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for dark mode */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1f2937; /* gray-800 */
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #4f46e5; /* indigo-600 */
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4338ca; /* indigo-700 */
+        }
+        /* Hide number input arrows */
+        input[type='number']::-webkit-inner-spin-button,
+        input[type='number']::-webkit-outer-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+        input[type='number'] {
+            -moz-appearance: textfield;
+        }
+    </style>
+</head>
+
+<body class="h-full bg-gray-900 text-gray-200">
+
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="fixed inset-0 bg-gray-900 flex flex-col items-center justify-center z-50">
+        <svg class="animate-spin h-10 w-10 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <span id="loading-text" class="mt-4 text-lg font-medium text-gray-300">Loading Your Prep Platform...</span>
+    </div>
+
+    <!-- Main App Container (Hidden by default) -->
+    <div id="app-container" class="hidden">
+
+        <!-- Header -->
+        <header class="bg-indigo-900/50 backdrop-blur-sm fixed top-0 left-0 right-0 z-40">
+            <nav class="mx-auto flex max-w-7xl items-center justify-between p-6 lg:px-8" aria-label="Global">
+                <div class="flex lg:flex-1">
+                    <a href="#" class="-m-1.5 p-1.5">
+                        <span class="sr-only">PrepAI</span>
+                        <i data-lucide="brain-circuit" class="h-8 w-8 text-indigo-400"></i>
+                    </a>
+                </div>
+                <div class="flex gap-x-8" id="main-nav">
+                    <!-- Nav links injected by JS -->
+                </div>
+            </nav>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="pt-20"> <!-- Padding top to offset fixed header -->
+            
+            <!-- PAGE: Home -->
+            <div id="home-page" class="">
+                <div class="relative isolate overflow-hidden">
+                    <!-- Gradient Background -->
+                    <svg class="absolute inset-0 -z-10 h-full w-full stroke-white/10 [mask-image:radial-gradient(100%_100%_at_top_right,white,transparent)]" aria-hidden="true">
+                        <defs>
+                            <pattern id="983e3e4c-de6d-4c3f-8d64-b9761d1534cc" width="200" height="200" x="50%" y="-1" patternUnits="userSpaceOnUse">
+                                <path d="M.5 200V.5H200" fill="none" />
+                            </pattern>
+                        </defs>
+                        <rect width="100%" height="100%" stroke-width="0" fill="url(#983e3e4c-de6d-4c3f-8d64-b9761d1534cc)" />
+                    </svg>
+                    <div class="absolute inset-x-0 bottom-0 -z-10 h-2/3 bg-gradient-to-t from-gray-900" aria-hidden="true"></div>
+
+                    <div class="mx-auto max-w-7xl px-6 pb-24 pt-10 sm:pb-32 lg:flex lg:px-8 lg:py-40">
+                        <div class="mx-auto max-w-2xl flex-shrink-0 lg:mx-0 lg:max-w-xl lg:pt-8">
+                            <h1 class="mt-10 text-4xl font-bold tracking-tight text-white sm:text-6xl">
+                                Personalised Tech Interview Prep for Your Dream Role
+                            </h1>
+                            <p class="mt-6 text-lg leading-8 text-gray-300">
+                                AI-driven skill mapping, progress tracking, and role readiness analysis. Stop guessing, start preparing with a data-driven plan.
+                            </p>
+                            <div class="mt-10 flex items-center gap-x-6">
+                                <button id="home-start-btn" class="rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                    Start My Journey
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mx-auto mt-16 flex max-w-2xl sm:mt-24 lg:ml-10 lg:mr-0 lg:mt-0 lg:max-w-none lg:flex-none xl:ml-32">
+                            <!-- Fancy Hero Preview -->
+                            <div class="max-w-3xl flex-none sm:max-w-5xl lg:max-w-none">
+                                <div class="-m-2 rounded-xl bg-gray-900/5 p-2 ring-1 ring-inset ring-white/10 lg:-m-4 lg:rounded-2xl lg:p-4">
+                                    <div class="rounded-md bg-gray-800 shadow-2xl ring-1 ring-white/10 p-4 space-y-4">
+                                        <!-- Fake Header -->
+                                        <div class="flex justify-between items-center">
+                                            <div class="flex items-center space-x-2">
+                                                <i data-lucide="brain-circuit" class="h-6 w-6 text-indigo-400"></i>
+                                                <span class="font-bold text-white">PrepAI Dashboard</span>
+                                            </div>
+                                            <div class="flex space-x-2">
+                                                <div class="w-16 h-6 rounded bg-indigo-600/50 animate-pulse"></div>
+                                                <div class="w-24 h-6 rounded bg-indigo-600/50 animate-pulse"></div>
+                                            </div>
+                                        </div>
+                                        <!-- Fake Body -->
+                                        <div class="grid grid-cols-3 gap-4">
+                                            <!-- Left Col -->
+                                            <div class="col-span-2 space-y-4">
+                                                <div class="p-4 rounded-lg bg-gray-700/50">
+                                                    <div class="h-5 w-3/4 rounded bg-gray-600 mb-3"></div>
+                                                    <div class="w-full bg-gray-600/50 rounded-full h-2.5">
+                                                        <div class="bg-indigo-500 h-2.5 rounded-full" style="width: 45%"></div>
+                                                    </div>
+                                                </div>
+                                                <div class="p-4 rounded-lg bg-gray-700/50">
+                                                    <div class="h-5 w-1/2 rounded bg-gray-600 mb-3"></div>
+                                                    <div class="space-y-2">
+                                                        <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                        <div class="h-3 w-5/6 rounded bg-gray-600/50"></div>
+                                                        <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <!-- Right Col -->
+                                            <div class="col-span-1 p-4 rounded-lg bg-gray-700/50">
+                                                <div class="h-5 w-full rounded bg-gray-600 mb-3"></div>
+                                                <div class="space-y-2">
+                                                    <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                    <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                    <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                    <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                    <div class="h-3 w-full rounded bg-gray-600/50"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Features Section -->
+                <div class="mx-auto mt-16 max-w-7xl px-6 sm:mt-20 lg:px-8">
+                    <dl class="grid max-w-2xl grid-cols-1 gap-x-8 gap-y-16 text-base leading-7 sm:grid-cols-2 lg:mx-0 lg:max-w-none lg:grid-cols-4">
+                        <div>
+                            <dt class="font-semibold text-white flex items-center gap-x-2"><i data-lucide="map" class="w-5 h-5 text-indigo-400"></i> Personalized Roadmap</dt>
+                            <dd class="mt-1 text-gray-300">Stop guessing. Get a data-driven study plan based on your target role, timeline, and current skills.</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-white flex items-center gap-x-2"><i data-lucide="pie-chart" class="w-5 h-5 text-indigo-400"></i> Role Readiness Analysis</dt>
+                            <dd class="mt-1 text-gray-300">See exactly where you stand. We benchmark your skills against 20 LPA+ job requirements.</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-white flex items-center gap-x-2"><i data-lucide="link" class="w-5 h-5 text-indigo-400"></i> LeetCode Integration</dt>
+                            <dd class="mt-1 text-gray-300">(Coming Soon) Sync your progress. We track your solved problems to update your readiness score.</dd>
+                        </div>
+                        <div>
+                            <dt class="font-semibold text-white flex items-center gap-x-2"><i data-lucide="bot" class="w-5 h-5 text-indigo-400"></i> AI Career Assistant</dt>
+                            <dd class="mt-1 text-gray-300">Your 24/7 mentor. Ask for roadmaps, problem explanations, or mock interview questions.</dd>
+                        </div>
+                    </dl>
+                </div>
+            </div>
+
+            <!-- PAGE: Setup Wizard -->
+            <div id="setup-page" class="hidden">
+                <div class="mx-auto max-w-4xl px-4 py-16 sm:px-6 lg:px-8">
+                    <h1 class="text-3xl font-bold tracking-tight text-white">Set Up Your Profile</h1>
+                    <p class="mt-2 text-gray-300">This data helps us build your personalized roadmap.</p>
+
+                    <!-- Progress Bar -->
+                    <nav aria-label="Progress" class="mt-8">
+                        <ol role="list" class="flex items-center">
+                            <li class="relative pr-8 sm:pr-20">
+                                <div class="progress-step absolute inset-0 flex items-center" aria-hidden="true">
+                                    <div class="h-0.5 w-full bg-indigo-600"></div>
+                                </div>
+                                <span class="relative flex h-8 w-8 items-center justify-center rounded-full bg-indigo-600">
+                                    <i data-lucide="check" class="progress-dot-complete h-5 w-5 text-white hidden" aria-hidden="true"></i>
+                                    <span class="progress-dot-current relative flex h-3 w-3 items-center justify-center">
+                                        <span class="absolute h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75"></span>
+                                        <span class="relative inline-flex h-2 w-2 rounded-full bg-indigo-500"></span>
+                                    </span>
+                                </span>
+                            </li>
+                            <li class="relative pr-8 sm:pr-20">
+                                <div class="progress-step absolute inset-0 flex items-center" aria-hidden="true">
+                                    <div class="h-0.5 w-full bg-gray-600"></div>
+                                </div>
+                                <span class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-gray-600 bg-gray-900">
+                                     <i data-lucide="check" class="progress-dot-complete h-5 w-5 text-white hidden" aria-hidden="true"></i>
+                                     <span class="progress-dot-current relative flex h-3 w-3 items-center justify-center hidden">
+                                        <span class="absolute h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75"></span>
+                                        <span class="relative inline-flex h-2 w-2 rounded-full bg-indigo-500"></span>
+                                    </span>
+                                </span>
+                            </li>
+                            <li class="relative pr-8 sm:pr-20">
+                                <div class="progress-step absolute inset-0 flex items-center" aria-hidden="true">
+                                    <div class="h-0.5 w-full bg-gray-600"></div>
+                                </div>
+                                <span class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-gray-600 bg-gray-900">
+                                     <i data-lucide="check" class="progress-dot-complete h-5 w-5 text-white hidden" aria-hidden="true"></i>
+                                     <span class="progress-dot-current relative flex h-3 w-3 items-center justify-center hidden">
+                                        <span class="absolute h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75"></span>
+                                        <span class="relative inline-flex h-2 w-2 rounded-full bg-indigo-500"></span>
+                                    </span>
+                                </span>
+                            </li>
+                            <li class="relative">
+                                <div class="progress-step absolute inset-0 flex items-center" aria-hidden="true">
+                                    <div class="h-0.5 w-full bg-gray-600"></div>
+                                </div>
+                                <span class="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-gray-600 bg-gray-900">
+                                     <i data-lucide="check" class="progress-dot-complete h-5 w-5 text-white hidden" aria-hidden="true"></i>
+                                     <span class="progress-dot-current relative flex h-3 w-3 items-center justify-center hidden">
+                                        <span class="absolute h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75"></span>
+                                        <span class="relative inline-flex h-2 w-2 rounded-full bg-indigo-500"></span>
+                                    </span>
+                                </span>
+                            </li>
+                        </ol>
+                    </nav>
+
+                    <!-- Form Steps -->
+                    <form id="setup-form" class="mt-12">
+                        <div id="setup-wizard-container">
+                            <!-- Step 1: Personal -->
+                            <div id="setup-step-1" class="setup-step">
+                                <h2 class="text-xl font-semibold text-white">Step 1: Personal Information</h2>
+                                <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-8 sm:grid-cols-6">
+                                    <div class="sm:col-span-3">
+                                        <label for="name" class="block text-sm font-medium leading-6 text-white">Full Name</label>
+                                        <input type="text" name="name" id="name" required class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="college" class="block text-sm font-medium leading-6 text-white">College Name</label>
+                                        <input type="text" name="college" id="college" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="course" class="block text-sm font-medium leading-6 text-white">Course & Specialization</label>
+                                        <select id="course" name="course" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option>Data Science</option>
+                                            <option>AIML</option>
+                                            <option>IoT</option>
+                                            <option>Core (Mechanical, Electrical, etc.)</option>
+                                            <option>Others</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="year" class="block text-sm font-medium leading-6 text-white">Current Year of Study</label>
+                                        <select id="year" name="year" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="1">1st Year</option>
+                                            <option value="2">2nd Year</option>
+                                            <option value="3">3rd Year</option>
+                                            <option value="4">4th Year</option>
+                                            <option value="graduated">Graduated</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="cgpa" class="block text-sm font-medium leading-6 text-white">Current CGPA (out of 10)</label>
+                                        <input type="number" name="cgpa" id="cgpa" step="0.1" min="0" max="10" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                </div>
+                                <div class="mt-8 flex justify-end">
+                                    <button type="button" data-next="2" class="setup-next-btn rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                        Next: Career Details &rarr;
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Step 2: Career -->
+                            <div id="setup-step-2" class="setup-step hidden">
+                                <h2 class="text-xl font-semibold text-white">Step 2: Career Details</h2>
+                                <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-8 sm:grid-cols-6">
+                                    <div class="sm:col-span-3">
+                                        <label for="experience" class="block text-sm font-medium leading-6 text-white">Experience Level</label>
+                                        <select id="experience" name="experience" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="beginner">Beginner (0-1 year)</option>
+                                            <option value="intermediate">Intermediate (1-3 years)</option>
+                                            <option value="advanced">Advanced (3+ years)</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="timeline" class="block text-sm font-medium leading-6 text-white">When is your interview?</label>
+                                        <select id="timeline" name="timeline" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="1m">In <1 Month</option>
+                                            <option value="3m">1-3 Months</option>
+                                            <option value="6m">3-6 Months</option>
+                                            <option value="long">6+ Months / Not scheduled</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="tier" class="block text-sm font-medium leading-6 text-white">Target Company Tier</label>
+                                        <select id="tier" name="tier" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="tier1">Tier 1 (20 LPA+) – Google, Amazon, etc.</option>
+                                            <option value="tier2">Tier 2 (10–19 LPA) – Adobe, Paytm, Zoho, etc.</option>
+                                            <option value="tier3">Tier 3 (<10 LPA) – Startups, Service-based</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="role" class="block text-sm font-medium leading-6 text-white">Preferred Career Role</label>
+                                        <select id="role" name="role" required class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <!-- Options populated by JS -->
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="mt-8 flex justify-between">
+                                    <button type="button" data-prev="1" class="setup-prev-btn rounded-md bg-white/10 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-white/20">
+                                        &larr; Previous
+                                    </button>
+                                    <button type="button" data-next="3" class="setup-next-btn rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                        Next: Skills &rarr;
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <!-- Step 3: Skills -->
+                            <div id="setup-step-3" class="setup-step hidden">
+                                <h2 class="text-xl font-semibold text-white">Step 3: Skills You Already Know</h2>
+                                <p class="mt-1 text-sm text-gray-300">Select the technologies you are comfortable with for your chosen role.</p>
+                                <fieldset class="mt-6">
+                                    <legend class="sr-only">Skills</legend>
+                                    <div id="skills-checkbox-container" class="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                                        <!-- Checkboxes populated by JS -->
+                                    </div>
+                                </fieldset>
+                                <div class="mt-8 flex justify-between">
+                                    <button type="button" data-prev="2" class="setup-prev-btn rounded-md bg-white/10 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-white/20">
+                                        &larr; Previous
+                                    </button>
+                                    <button type="button" data-next="4" class="setup-next-btn rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                        Next: DSA Topics &rarr;
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <!-- Step 4: DSA -->
+                            <div id="setup-step-4" class="setup-step hidden">
+                                <h2 class="text-xl font-semibold text-white">Step 4: DSA Topic Level Selection</h2>
+                                <p class="mt-1 text-sm text-gray-300">How comfortable are you with the following topics?</p>
+                                <div id="dsa-grid" class="mt-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    <!-- DSA topics populated by JS -->
+                                </div>
+                                <div class="mt-8 flex justify-between">
+                                    <button type="button" data-prev="3" class="setup-prev-btn rounded-md bg-white/10 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-white/20">
+                                        &larr; Previous
+                                    </button>
+                                    <button type="submit" class="rounded-md bg-green-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-green-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-green-600">
+                                        Finish & Build My Dashboard
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- PAGE: Dashboard -->
+            <div id="dashboard-page" class="hidden">
+                <div class="mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8">
+                    <header class="mb-8">
+                        <h1 id="dashboard-welcome" class="text-3xl font-bold tracking-tight text-white">Welcome, User!</h1>
+                        <p id="dashboard-subheader" class="mt-1 text-lg text-gray-300">Your readiness analysis for: SDE (Tier 1)</p>
+                    </header>
+                    
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <!-- Left Column: Main Analysis -->
+                        <div class="lg:col-span-2 space-y-6">
+                            <!-- Roadmap Promo -->
+                            <div id="roadmap-promo-container" class="bg-gray-800 shadow-lg rounded-lg px-4 py-5 sm:p-6">
+                                <!-- Content injected by renderRoadmapSection -->
+                            </div>
+                            
+                            <!-- DSA Mastery -->
+                            <div class="bg-gray-800 shadow-lg rounded-lg">
+                                <div class="px-4 py-5 sm:p-6">
+                                    <h3 class="text-base font-semibold leading-6 text-white">DSA Mastery</h3>
+                                    <p class="mt-1 text-sm text-gray-300">
+                                        Your Target: <strong id="dsa-mastery-target" class="text-indigo-400">...</strong>
+                                    </p>
+                                    <p class="mt-2 text-sm text-gray-300">
+                                        (Coming Soon) Your Progress: <strong class="text-white">... LeetCode problems solved</strong>
+                                    </p>
+                                </div>
+                            </div>
+
+                            <!-- Skill Gap Analysis -->
+                            <div class="bg-gray-800 shadow-lg rounded-lg">
+                                <div class="px-4 py-5 sm:p-6">
+                                    <h3 class="text-base font-semibold leading-6 text-white">Core Skill Gap Analysis</h3>
+                                    <ul id="skill-gap-analysis" role="list" class="mt-4 divide-y divide-white/10">
+                                        <!-- Content injected by renderGapAnalysis -->
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Right Column: DSA Topics -->
+                        <div class="lg:col-span-1">
+                            <div class="bg-gray-800 shadow-lg rounded-lg">
+                                <div class="px-4 py-5 sm:p-6">
+                                    <h3 class="text-base font-semibold leading-6 text-white">DSA Topic Strength</h3>
+                                    <ul id="dsa-gap-analysis" role="list" class="mt-4 divide-y divide-white/10 max-h-[600px] overflow-y-auto">
+                                        <!-- Content injected by renderGapAnalysis -->
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- PAGE: Roadmap -->
+            <div id="roadmap-page" class="hidden">
+                 <div class="mx-auto max-w-4xl px-4 py-12 sm:px-6 lg:px-8">
+                    <!-- Back Button -->
+                    <button type="button" class="nav-link mb-4 flex items-center gap-x-2 text-sm font-semibold text-gray-300 hover:text-white" data-page="dashboard-page">
+                        <i data-lucide="arrow-left" class="h-4 w-4"></i>
+                        Back to Dashboard
+                    </button>
+                    <!-- End Back Button -->
+                    <header class="mb-8">
+                        <h1 id="roadmap-header" class="text-3xl font-bold tracking-tight text-white">Your Roadmap</h1>
+                        <p class="mt-1 text-lg text-gray-300">Your step-by-step plan to get interview-ready.</p>
+                    </header>
+                    <div id="roadmap-page-container">
+                        <!-- Content injected by renderRoadmapPage -->
+                    </div>
+                 </div>
+            </div>
+            
+            <!-- PAGE: Profile -->
+            <div id="profile-page" class="hidden">
+                 <div class="mx-auto max-w-4xl px-4 py-12 sm:px-6 lg:px-8">
+                    <!-- Back Button -->
+                    <button type="button" class="nav-link mb-4 flex items-center gap-x-2 text-sm font-semibold text-gray-300 hover:text-white" data-page="dashboard-page">
+                        <i data-lucide="arrow-left" class="h-4 w-4"></i>
+                        Back to Dashboard
+                    </button>
+                    <!-- End Back Button -->
+                    <header class="mb-8">
+                        <h1 class="text-3xl font-bold tracking-tight text-white">Update Your Profile</h1>
+                        <p class="mt-1 text-lg text-gray-300">Update your goals and personal information.</p>
+                    </header>
+                    
+                    <form id="profile-update-form" class="bg-gray-800 shadow-lg rounded-lg p-6">
+                        <div class="space-y-8">
+                            <!-- Personal Info -->
+                            <div>
+                                <h2 class="text-xl font-semibold text-white">Personal Information</h2>
+                                <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-8 sm:grid-cols-6">
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-name" class="block text-sm font-medium leading-6 text-white">Full Name</label>
+                                        <input type="text" name="profile-name" id="profile-name" required class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-college" class="block text-sm font-medium leading-6 text-white">College Name</label>
+                                        <input type="text" name="profile-college" id="profile-college" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-course" class="block text-sm font-medium leading-6 text-white">Course</label>
+                                        <input type="text" name="profile-course" id="profile-course" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-year" class="block text-sm font-medium leading-6 text-white">Year</label>
+                                        <select id="profile-year" name="profile-year" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="1">1st Year</option>
+                                            <option value="2">2nd Year</option>
+                                            <option value="3">3rd Year</option>
+                                            <option value="4">4th Year</option>
+                                            <option value="graduated">Graduated</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-cgpa" class="block text-sm font-medium leading-6 text-white">CGPA</label>
+                                        <input type="number" name="profile-cgpa" id="profile-cgpa" step="0.1" min="0" max="10" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Career Details -->
+                             <div>
+                                <h2 class="text-xl font-semibold text-white">Career Details</h2>
+                                <p class="text-sm text-yellow-300 mt-2">Warning: Changing your Role or Tier will reset your AI Roadmap.</p>
+                                <div class="mt-6 grid grid-cols-1 gap-x-6 gap-y-8 sm:grid-cols-6">
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-experience" class="block text-sm font-medium leading-6 text-white">Experience</label>
+                                        <select id="profile-experience" name="profile-experience" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="beginner">Beginner (0-1 year)</option>
+                                            <option value="intermediate">Intermediate (1-3 years)</option>
+                                            <option value-="advanced">Advanced (3+ years)</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-timeline" class="block text-sm font-medium leading-6 text-white">Timeline</label>
+                                        <select id="profile-timeline" name="profile-timeline" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="1m">In <1 Month</option>
+                                            <option value="3m">1-3 Months</option>
+                                            <option value="6m">3-6 Months</option>
+                                            <option value="long">6+ Months / Not scheduled</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-tier" class="block text-sm font-medium leading-6 text-white">Target Tier</labe>
+                                        <select id="profile-tier" name="profile-tier" class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <option value="tier1">Tier 1 (20 LPA+)</option>
+                                            <option value="tier2">Tier 2 (10–19 LPA)</option>
+                                            <option value="tier3">Tier 3 (<10 LPA)</option>
+                                        </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                        <label for="profile-role" class="block text-sm font-medium leading-6 text-white">Target Role</label>
+                                        <select id="profile-role" name="profile-role" required class="mt-2 block w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6">
+                                            <!-- Options populated by JS -->
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mt-8 flex justify-end">
+                            <button type="submit" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                Save Changes
+                            </button>
+                        </div>
+                    </form>
+                 </div>
+            </div>
+
+        </main>
+        
+        <!-- AI Chatbot (Mock) -->
+        <div class="fixed bottom-6 right-6 z-40">
+            <button id="chat-toggle" type="button" class="animate-pulse rounded-full bg-indigo-600 p-3 text-white shadow-lg hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-900">
+                <i data-lucide="bot" class="h-6 w-6" aria-hidden="true"></i>
+            </button>
+            <div id="chat-window" class="hidden absolute bottom-20 right-0 w-80 rounded-lg bg-gray-800 shadow-2xl border border-white/10">
+                <div class="flex items-center justify-between p-3 border-b border-white/10">
+                    <h3 class="text-base font-semibold text-white">AI Career Assistant</h3>
+                    <button id="chat-close" class="text-gray-400 hover:text-white p-1 -mt-1 -mr-1">
+                         <i data-lucide="x" class="h-5 w-5" aria-hidden="true"></i>
+                    </button>
+                </div>
+                <div class="p-4 h-64 overflow-y-auto space-y-3">
+                    <div class="flex">
+                        <div class="p-2 rounded-lg bg-indigo-600 text-white text-sm max-w-xs">
+                            Hi! I'm your AI assistant. Ask me to explain a concept or suggest a practice problem.
+                        </div>
+                    </div>
+                </div>
+                <div class="p-3 border-t border-white/10">
+                    <input type="text" placeholder="Ask me anything..." class="w-full rounded-md border-0 bg-white/5 py-1.5 text-white shadow-sm ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm">
+                </div>
+            </div>
+        </div>
+
+    </div> <!-- End #app-container -->
+
+    <!-- Custom Modal -->
+    <div id="custom-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 hidden">
+        <div class="bg-gray-800 rounded-lg shadow-2xl p-6 w-full max-w-sm mx-4 ring-1 ring-white/10">
+            <h3 id="modal-title" class="text-lg font-semibold text-white">Modal Title</h3>
+            <p id="modal-message" class="mt-2 text-sm text-gray-300">Modal message goes here.</p>
+            <div id="modal-buttons" class="mt-6 flex justify-end space-x-3">
+                <button id="modal-btn-cancel" class="rounded-md bg-white/10 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-white/20">Cancel</button>
+                <button id="modal-btn-confirm" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
+
